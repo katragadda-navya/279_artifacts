@@ -34,8 +34,6 @@
     "Idle Mean",
     "Idle Max"
   ],
-  "cat_maps": [],
-  "cat_cardinalities": [],
   "model_hparams": {
     "d_token": 16,
     "n_heads": 2,

@@ -180,12 +180,23 @@ def load_ftt(n_num, n_classes):
 
 # ----------------------------- inference wrappers ------------------------------------
 def predict_lgbm(df_num: np.ndarray, classes):
+    import lightgbm as lgb, joblib
     booster = load_lgbm()
-    proba = booster.predict(df_num)  # shape [N, C]
+    ohe_path = ARTIFACTS_DIR / "ohe.joblib"
+    X = df_num
+    if ohe_path.exists():
+        # Rebuild a DataFrame with the schema columns so ColumnTransformer can work
+        num_cols, cat_cols, _ = load_schema()
+        # In the app we only have numeric matrix; if cat_cols existed at train time,
+        # you should pass a matched DataFrame here instead (or store OHE’d matrix).
+        # For pure-numeric training (cat_cols == []), this block is skipped anyway.
+        pass
+    proba = booster.predict(X)
     yhat = proba.argmax(1)
     labels = [classes[i] for i in yhat]
     conf   = proba.max(1)
     return labels, conf, proba
+
 
 
 def predict_mlp(df_num: np.ndarray, classes):
