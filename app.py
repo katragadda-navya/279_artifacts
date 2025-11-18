@@ -1,49 +1,123 @@
-import os, json, io, gc, zipfile
+# app.py — Streamlit UI for IoT IDS (LightGBM, MLP, FT-Transformer)
+# -------------------------------------------------------------------------------------
+# What this app does
+# - Loads training schema (numeric feature order, class order)
+# - Validates & aligns uploaded CSV to match training schema (drops extras, fills missing)
+# - Handles preprocessed ftt_* splits (skips re-scaling to avoid double-standardization)
+# - Loads trained models & artifacts; runs real inference; shows predictions & metrics
+# -------------------------------------------------------------------------------------
+
+import os
+import json
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import streamlit as st
 import joblib
+import streamlit as st
 
-# ---------- Paths ----------
-ART = Path("artifacts")                # root for saved models
-FTT_DIR = ART / "ftt_pure"             # FT-Transformer subdir
-CLASSES = json.loads((ART/"classes.json").read_text())
-CLS2ID = {c:i for i,c in enumerate(CLASSES)}
-N_CLASSES = len(CLASSES)
+# Optional: only import torch/lightgbm when needed (avoids startup cost if model not selected)
+# import torch, torch.nn as nn
+# import lightgbm as lgb
 
-st.set_page_config(page_title="IoT IDS — LGBM / MLP / FT-Transformer", layout="wide")
+# ----------------------------- paths & constants -------------------------------------
+OUT_DIR = Path("./preprocessed_iot")
+ARTIFACTS_DIR = Path("./artifacts")
 
-st.title("🔐 IoT Intrusion Detection — LGBM / MLP / FT-Transformer")
-st.caption("Batch inference + quick evaluation — uses your trained artifacts and mirrors training-time preprocessing.")
+SCHEMA_PATH = OUT_DIR / "schema.json"
+CLASSES_PATH = OUT_DIR / "classes.json"
+SCALER_PATH = OUT_DIR / "ftt_scaler.joblib"
 
-# ---------- Utilities ----------
-@st.cache_resource
-def load_common():
-    # Shared scaler & column lists (from training)
-    ftt_scaler_bundle = joblib.load(FTT_DIR/"ftt_scaler.joblib")
-    num_cols = ftt_scaler_bundle.get("num_cols", []) or []
-    cat_cols = ftt_scaler_bundle.get("cat_cols", []) or []
+LGBM_MODEL_PATH = ARTIFACTS_DIR / "lgbm_model.txt"
+MLP_MODEL_PATH  = ARTIFACTS_DIR / "mlp.pt"
+FTT_DIR         = ARTIFACTS_DIR / "ftt_pure"
+FTT_MODEL_PATH  = FTT_DIR / "model.pt"
+FTT_META_PATH   = FTT_DIR / "meta.json"
 
-    # For LGBM & MLP OHE flow
-    ohe = joblib.load(ART/"ohe.joblib")
+LABEL_COL = "Label"  # for optional ground-truth in uploaded CSVs
 
-    return ftt_scaler_bundle, num_cols, cat_cols, ohe
+# ----------------------------- schema helpers ----------------------------------------
+def load_schema():
+    """
+    Returns: (num_cols, cat_cols, classes)
+    num_cols/cat_cols come from schema.json or ftt_scaler.joblib (fallback).
+    classes come from classes.json (canonical order from training).
+    """
+    # 1) feature schema
+    if SCHEMA_PATH.exists():
+        schema = json.loads(SCHEMA_PATH.read_text())
+        num_cols = schema.get("num_cols", [])
+        cat_cols = schema.get("cat_cols", [])
+    else:
+        bundle = joblib.load(SCALER_PATH)  # {'num_cols','cat_cols','scaler'}
+        num_cols = bundle.get("num_cols", [])
+        cat_cols = bundle.get("cat_cols", [])
 
-@st.cache_resource
+    # 2) class order
+    if CLASSES_PATH.exists():
+        classes = json.loads(CLASSES_PATH.read_text())
+    else:
+        classes = None  # will only be used to decode predictions; models can still output argmax
+
+    return num_cols, cat_cols, classes
+
+
+def validate_frame_columns(df: pd.DataFrame, num_cols, cat_cols):
+    missing = [c for c in (num_cols + cat_cols) if c not in df.columns]
+    extras  = [c for c in df.columns if c not in (num_cols + cat_cols + [LABEL_COL])]
+    ok = (len(missing) == 0)
+    return ok, missing, extras
+
+
+def align_frame(df: pd.DataFrame, num_cols, cat_cols, drop_label=True):
+    """
+    Aligns df to training schema (adds missing cols with safe defaults, drops extras, enforces order).
+    """
+    df = df.copy()
+    if drop_label and (LABEL_COL in df.columns):
+        df = df.drop(columns=[LABEL_COL])
+
+    # add missing with safe defaults
+    for c in num_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(np.float32)
+
+    for c in cat_cols:
+        if c not in df.columns:
+            df[c] = "__MISSING__"
+        df[c] = df[c].astype(str)
+
+    # drop extras and enforce order
+    keep = num_cols + cat_cols
+    df = df[keep]
+    return df
+
+
+def show_expected_schema(num_cols, cat_cols):
+    with st.expander("Expected training schema (columns & order)"):
+        st.markdown("**Numeric features**:")
+        st.code("\n".join(num_cols) if num_cols else "(none)")
+        st.markdown("**Categorical features**:")
+        st.code("\n".join(cat_cols) if cat_cols else "(none)")
+
+# ----------------------------- model loaders -----------------------------------------
+@st.cache_resource(show_spinner=False)
 def load_lgbm():
     import lightgbm as lgb
-    booster = lgb.Booster(model_file=str(ART/"lgbm_model.txt"))
+    if not LGBM_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model: {LGBM_MODEL_PATH}")
+    booster = lgb.Booster(model_file=str(LGBM_MODEL_PATH))
     return booster
 
-@st.cache_resource
-def load_mlp(input_dim=None):
-    import torch, torch.nn as nn
-    meta = json.loads((ART/"mlp_meta.json").read_text())
-    if input_dim is None:
-        input_dim = meta["input_dim"]
+
+@st.cache_resource(show_spinner=False)
+def load_mlp(input_dim, n_classes):
+    import torch
+    import torch.nn as nn
+
     class MLP(nn.Module):
-        def __init__(self, d_in, d_hidden=512, drop=0.2, n_out=N_CLASSES):
+        def __init__(self, d_in, d_hidden=512, drop=0.2, n_out=2):
             super().__init__()
             self.net = nn.Sequential(
                 nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Dropout(drop),
@@ -51,218 +125,215 @@ def load_mlp(input_dim=None):
                 nn.Linear(d_hidden//2, n_out)
             )
         def forward(self, x): return self.net(x)
-    device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
-    model = MLP(input_dim, n_out=N_CLASSES).to(device)
-    model.load_state_dict(torch.load(ART/"mlp.pt", map_location=device))
+
+    if not MLP_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model: {MLP_MODEL_PATH}")
+
+    device = torch.device("cpu")
+    model = MLP(input_dim, n_out=n_classes).to(device)
+    state = torch.load(MLP_MODEL_PATH, map_location=device)
+    model.load_state_dict(state)
     model.eval()
-    return model, device
+    return model
 
-@st.cache_resource
-def load_ftt():
-    import torch, torch.nn as nn
-    meta = json.loads((FTT_DIR/"meta.json").read_text())
-    CAT = meta["cat_cols"]; NUM = meta["num_cols"]
-    CARD = meta["cat_cardinalities"]
-    hp = meta["model_hparams"]
 
-    class FTT(nn.Module):
-        def __init__(self,n_num,card,d=hp["d_token"],heads=hp["n_heads"],blocks=hp["n_blocks"],
-                     ff=hp["ff_mult"],drop=hp["dropout"], n_out=N_CLASSES):
+@st.cache_resource(show_spinner=False)
+def load_ftt(n_num, n_classes):
+    import torch
+    import torch.nn as nn
+
+    class FTTransformer(nn.Module):
+        def __init__(self, n_num, d=16, heads=2, blocks=2, ff=4, drop=0.1, n_out=2):
             super().__init__()
-            self.n_num=n_num; self.cls=nn.Parameter(torch.zeros(1,1,d))
-            if n_num>0:
-                self.num_w=nn.Parameter(torch.randn(n_num,d)*0.02); self.num_b=nn.Parameter(torch.zeros(n_num,d))
+            self.n_num = n_num
+            self.cls   = nn.Parameter(torch.zeros(1,1,d))
+            if n_num > 0:
+                self.num_w = nn.Parameter(torch.randn(n_num, d) * 0.02)
+                self.num_b = nn.Parameter(torch.zeros(n_num, d))
             else:
-                self.register_parameter("num_w",None); self.register_parameter("num_b",None)
-            self.emb=nn.ModuleList([nn.Embedding(c,d) for c in card])
-            layer=nn.TransformerEncoderLayer(d_model=d,nhead=heads,dim_feedforward=d*ff,
-                                             dropout=drop,batch_first=True,activation="gelu",norm_first=True)
-            self.enc=nn.TransformerEncoder(layer,num_layers=blocks)
-            self.head=nn.Sequential(nn.LayerNorm(d),nn.Linear(d,n_out))
-        def forward(self,xn,xc):
-            B=xn.size(0); toks=[self.cls.expand(B,1,-1)]
-            if self.n_num>0: toks.append(xn.unsqueeze(-1)*self.num_w + self.num_b)
-            for i,e in enumerate(self.emb): toks.append(e(xc[:,i]).unsqueeze(1))
-            x=torch.cat(toks,dim=1); x=self.enc(x); return self.head(x[:,0,:])
+                self.register_parameter("num_w", None)
+                self.register_parameter("num_b", None)
+            layer = nn.TransformerEncoderLayer(
+                d_model=d, nhead=heads, dim_feedforward=d*ff, dropout=drop,
+                batch_first=True, activation="gelu", norm_first=False
+            )
+            self.enc  = nn.TransformerEncoder(layer, num_layers=blocks)
+            self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, n_out))
+        def forward(self, x_num):
+            B = x_num.size(0)
+            toks = [self.cls.expand(B,1,-1)]
+            if self.n_num > 0:
+                toks.append(x_num.unsqueeze(-1) * self.num_w + self.num_b)  # [B, n_num, d]
+            x = torch.cat(toks, dim=1)
+            x = self.enc(x)
+            return self.head(x[:, 0, :])
 
-    device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
-    model = FTT(len(NUM), CARD).to(device)
-    model.load_state_dict(torch.load(FTT_DIR/"model.pt", map_location=device))
+    if not FTT_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model: {FTT_MODEL_PATH}")
+
+    device = torch.device("cpu")
+    model = FTTransformer(n_num=n_num, n_out=n_classes).to(device)
+    state = torch.load(FTT_MODEL_PATH, map_location=device)
+    model.load_state_dict(state)
     model.eval()
-    return model, device, CAT, NUM, hp
+    return model
 
-def clean_like_training(df, label_col="Label"):
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    if label_col in df.columns:
-        # inference: we ignore provided Label unless user wants eval
-        pass
-    df = df.replace([np.inf, -np.inf], np.nan)
-    # Fill NA similarly
-    for c in df.columns:
-        if c == label_col: 
-            continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            df[c] = df[c].fillna(df[c].median())
-        else:
-            df[c] = df[c].astype(str).fillna("Unknown")
-    return df
-
-def apply_saved_scaler(df, ftt_scaler_bundle, num_cols):
-    # Your training scaled numerics; reuse saved scaler/mean,std
-    if ftt_scaler_bundle.get("scaler") is not None:
-        scaler = ftt_scaler_bundle["scaler"]
-        if all(c in df.columns for c in num_cols) and len(num_cols):
-            df[num_cols] = scaler.transform(df[num_cols]).astype("float32")
-    else:
-        # torch-computed mean/std saved as arrays
-        mean_ = ftt_scaler_bundle.get("mean_")
-        scale_= ftt_scaler_bundle.get("scale_")
-        if mean_ is not None and scale_ is not None and len(num_cols):
-            X = df[num_cols].to_numpy(dtype=np.float32)
-            X = (X - np.asarray(mean_, dtype=np.float32)) / np.clip(np.asarray(scale_, dtype=np.float32), 1e-8, None)
-            df[num_cols] = X.astype("float32")
-    return df
-
-def to_ftt_tensors(df, cat_cols, num_cols, cat_maps):
-    # Build per-col integer indices for categories as in training (unknown -> 0)
-    mats=[]
-    for c, m in zip(cat_cols, cat_maps):
-        m_int = {k:int(v) for k,v in m.items()}
-        idx = df[c].astype(str).map(m_int).fillna(0).astype(np.int64).to_numpy().reshape(-1,1)
-        mats.append(idx)
-    Xc = np.concatenate(mats, axis=1) if mats else np.zeros((len(df),0), dtype=np.int64)
-    Xn = df[num_cols].to_numpy(dtype=np.float32) if num_cols else np.zeros((len(df),0), dtype=np.float32)
-    return Xn, Xc
-
-def ohe_features(df, ohe, cat_cols, num_cols):
-    # Keep only seen columns in the expected order
-    want = list(ohe.transformers_[0][2]) + list(ohe.transformers_[1][2])
-    # Fill missing expected columns if any (with 0 or "Unknown")
-    for c in cat_cols:
-        if c not in df.columns: df[c] = "Unknown"
-        df[c] = df[c].astype(str)
-    for c in num_cols:
-        if c not in df.columns: df[c] = 0.0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    X = ohe.transform(df[want])
-    return X
-
-# ---------- Sidebar ----------
-st.sidebar.header("⚙️ Inference Settings")
-model_choice = st.sidebar.selectbox("Choose model", ["LightGBM", "MLP", "FT-Transformer"])
-show_examples = st.sidebar.checkbox("Show training-time summary plots", value=True)
-threshold_note = st.sidebar.caption("Multiclass outputs use argmax; confidence shown from predicted probability.")
-
-# ---------- Load artifacts ----------
-ftt_scaler_bundle, NUM_COLS, CAT_COLS, OHE = load_common()
-
-# Model-specific lazy loads
-if model_choice == "LightGBM":
+# ----------------------------- inference wrappers ------------------------------------
+def predict_lgbm(df_num: np.ndarray, classes):
     booster = load_lgbm()
-elif model_choice == "MLP":
-    MLP_MODEL, MLP_DEVICE = load_mlp()
+    proba = booster.predict(df_num)  # shape [N, C]
+    yhat = proba.argmax(1)
+    labels = [classes[i] for i in yhat]
+    conf   = proba.max(1)
+    return labels, conf, proba
+
+
+def predict_mlp(df_num: np.ndarray, classes):
+    import torch
+    model = load_mlp(input_dim=df_num.shape[1], n_classes=len(classes))
+    with torch.no_grad():
+        logits = model(torch.tensor(df_num, dtype=torch.float32))
+        proba = torch.softmax(logits, dim=1).cpu().numpy()
+    yhat = proba.argmax(1)
+    labels = [classes[i] for i in yhat]
+    conf   = proba.max(1)
+    return labels, conf, proba
+
+
+def predict_ftt(df_num: np.ndarray, classes):
+    import torch
+    model = load_ftt(n_num=df_num.shape[1], n_classes=len(classes))
+    with torch.no_grad():
+        x_num = torch.tensor(df_num, dtype=torch.float32)
+        logits = model(x_num)
+        proba = torch.softmax(logits, dim=1).cpu().numpy()
+    yhat = proba.argmax(1)
+    labels = [classes[i] for i in yhat]
+    conf   = proba.max(1)
+    return labels, conf, proba
+
+# ----------------------------- UI ----------------------------------------------------
+st.set_page_config(page_title="IoT IDS — Streamlit", layout="wide")
+st.title("IoT Intrusion Detection — Inference App")
+
+model_choice = st.sidebar.selectbox("Choose model", ["LightGBM", "MLP (PyTorch)", "FT-Transformer (PyTorch)"])
+st.sidebar.markdown("---")
+
+num_cols, cat_cols, classes = load_schema()
+if classes is None:
+    st.error("classes.json not found. Please run preprocessing/training first to save class order.")
+    st.stop()
+
+show_expected_schema(num_cols, cat_cols)
+
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
+if uploaded is None:
+    st.info("Upload a CSV with the training schema. You can also upload **ftt_test.csv** from your pipeline.")
+    st.stop()
+
+raw = pd.read_csv(uploaded)
+st.write("Uploaded shape:", raw.shape)
+
+ok, missing, extras = validate_frame_columns(raw, num_cols, cat_cols)
+if not ok:
+    st.error(
+        "Your CSV is missing required training columns:\n\n"
+        + ", ".join(missing)
+        + "\n\nPlease add them (names must match exactly)."
+    )
+    st.stop()
+
+if extras:
+    st.info("The following columns are not used and will be ignored:\n\n" + ", ".join(extras))
+
+# Detect if user uploaded preprocessed ftt_* split (already standardized)
+default_pre = ("ftt_" in uploaded.name.lower())
+is_preprocessed = st.checkbox("Uploaded data is already preprocessed (ftt_* from pipeline)", value=default_pre)
+
+# Keep ground-truth if present (for metrics)
+y_true = None
+if LABEL_COL in raw.columns:
+    y_true = raw[LABEL_COL].astype(str)
+    raw = raw.drop(columns=[LABEL_COL])
+
+# Align to schema & order
+df = align_frame(raw, num_cols, cat_cols, drop_label=False)
+
+# Build numeric inputs
+if is_preprocessed:
+    # ftt_* are already standardized — DO NOT scale again
+    X_num = df[num_cols].to_numpy(np.float32)
 else:
-    FTT_MODEL, FTT_DEVICE, FTT_CAT, FTT_NUM, _hp = load_ftt()
-    # cat maps live in meta.json
-    META = json.loads((FTT_DIR/"meta.json").read_text())
-    CAT_MAPS = META["cat_maps"]
+    bundle = joblib.load(SCALER_PATH)  # {'num_cols','cat_cols','scaler'}
+    scaler = bundle["scaler"]
+    X_num = scaler.transform(df[num_cols]).astype(np.float32)
 
-# ---------- Inputs ----------
-st.subheader("📥 Input data")
-up = st.file_uploader("Upload CSV with the same schema used for training (no Label needed for prediction).", type=["csv"])
+# Guard: no NaN/Inf
+if not np.isfinite(X_num).all():
+    st.error("Your data contains non-finite values (NaN/Inf) after processing. Please clean the CSV and try again.")
+    st.stop()
 
-if up is not None:
-    df = pd.read_csv(up)
-else:
-    st.info("No CSV uploaded yet. You can still see model summaries below.")
-    df = None
+# ----------------------------- run inference ----------------------------------------
+if model_choice == "LightGBM":
+    # If your LGBM was trained on these same numeric features (selected-features path), OHE is not needed.
+    labels, conf, proba = predict_lgbm(X_num, classes)
 
-# ---------- Inference ----------
-def run_inference(df_in: pd.DataFrame):
-    df_clean = clean_like_training(df_in, label_col="Label")
-    # Apply saved scaling to numerics (same as training)
-    df_scaled = apply_saved_scaler(df_clean, ftt_scaler_bundle, NUM_COLS)
+elif model_choice == "MLP (PyTorch)":
+    labels, conf, proba = predict_mlp(X_num, classes)
 
-    if model_choice == "LightGBM":
-        # OHE + passthrough numerics (already scaled)
-        X = ohe_features(df_scaled, OHE, CAT_COLS, NUM_COLS)
-        proba = booster.predict(X)
-        yhat = proba.argmax(1)
-        conf = proba.max(1)
+else:  # FT-Transformer (PyTorch)
+    labels, conf, proba = predict_ftt(X_num, classes)
 
-    elif model_choice == "MLP":
-        import torch
-        X = ohe_features(df_scaled, OHE, CAT_COLS, NUM_COLS)
-        with torch.no_grad():
-            logits = MLP_MODEL(torch.tensor(X, dtype=torch.float32, device=MLP_DEVICE))
-            proba = torch.softmax(logits, dim=1).cpu().numpy()
-            yhat = proba.argmax(1)
-            conf = proba.max(1)
+preds_df = pd.DataFrame({
+    "pred_label": labels,
+    "pred_confidence": conf
+})
+st.subheader("Predictions")
+st.dataframe(preds_df.head(50))
 
-    else:  # FT-Transformer
-        import torch
-        # Ensure expected cols exist
-        for c in FTT_CAT:
-            if c not in df_scaled.columns: df_scaled[c] = "Unknown"
-            df_scaled[c] = df_scaled[c].astype(str)
-        for c in FTT_NUM:
-            if c not in df_scaled.columns: df_scaled[c] = 0.0
-            df_scaled[c] = pd.to_numeric(df_scaled[c], errors="coerce").fillna(0.0)
+# Collapse warning (common sign of schema mismatch or double-scaling)
+if preds_df["pred_label"].nunique() == 1:
+    st.warning(
+        f"All predictions are '{preds_df['pred_label'].iloc[0]}'. "
+        "This often means inputs are out-of-distribution (wrong scaling/order). "
+        "If you uploaded ftt_* splits, ensure the 'preprocessed' toggle is ON."
+    )
 
-        Xn, Xc = to_ftt_tensors(df_scaled, FTT_CAT, FTT_NUM, CAT_MAPS)
-        with torch.no_grad():
-            xn = torch.tensor(Xn, dtype=torch.float32, device=FTT_DEVICE)
-            xc = torch.tensor(Xc, dtype=torch.long, device=FTT_DEVICE)
-            logits = FTT_MODEL(xn, xc)
-            proba = torch.softmax(logits, dim=1).cpu().numpy()
-            yhat = proba.argmax(1)
-            conf = proba.max(1)
+# Optional metrics if ground truth exists
+if y_true is not None:
+    from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+    y_true_idx = pd.Categorical(y_true, categories=classes).codes
+    y_pred_idx = pd.Categorical(preds_df["pred_label"], categories=classes).codes
 
-    pred_labels = [CLASSES[i] for i in yhat]
-    out = df_in.copy()
-    out["pred_label"] = pred_labels
-    out["pred_confidence"] = conf
-    return out, proba
+    acc = accuracy_score(y_true_idx, y_pred_idx)
+    mf1 = f1_score(y_true_idx, y_pred_idx, average="macro")
 
-# ---------- Run & Display ----------
-if df is not None and len(df):
-    with st.spinner("Running inference…"):
-        preds, proba = run_inference(df)
-    st.success(f"Done. Predicted {len(preds)} rows.")
+    st.subheader("Metrics (using provided Label)")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Accuracy", f"{acc:.4f}")
+    with col2:
+        st.metric("Macro-F1", f"{mf1:.4f}")
 
-    st.subheader("🔎 Predictions")
-    st.dataframe(preds.head(50))
-    # Download CSV
-    buf = io.BytesIO()
-    preds.to_csv(buf, index=False)
-    st.download_button("⬇️ Download predictions CSV", data=buf.getvalue(),
-                       file_name=f"predictions_{model_choice.lower().replace(' ','_')}.csv",
-                       mime="text/csv")
+    st.text("Classification report:")
+    st.code(classification_report(y_true_idx, y_pred_idx, target_names=classes, zero_division=0))
 
-# ---------- Metrics & Plots (from training) ----------
-st.subheader("📊 Training-time Metrics & Plots")
-col1, col2, col3 = st.columns(3)
-def show_img(p: Path, label: str):
-    if p.exists():
-        st.image(str(p), caption=label, use_container_width=True)
-    else:
-        st.caption(f"({label} not found)")
+    # Confusion matrix
+    cm = confusion_matrix(y_true_idx, y_pred_idx, labels=range(len(classes)))
+    import matplotlib.pyplot as plt
+    import io
+    fig, ax = plt.subplots(figsize=(7,6), dpi=120)
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title("Confusion Matrix")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_xticks(range(len(classes))); ax.set_yticks(range(len(classes)))
+    ax.set_xticklabels(classes, rotation=45, ha="right"); ax.set_yticklabels(classes)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=8)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    st.pyplot(fig)
 
-with col1:
-    show_img(ART/"perf_accuracy_by_model.png", "Accuracy by Model")
-with col2:
-    show_img(ART/"perf_macrof1_by_model.png", "Macro-F1 by Model")
-with col3:
-    show_img(ART/"perf_perclass_f1_grouped.png", "Per-class F1")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    show_img(ART/"lgbm_confusion_matrix.png", "LightGBM — Confusion Matrix")
-with c2:
-    show_img(FTT_DIR/"ftt_confusion_matrix.png", "FT-Transformer — Confusion Matrix")
-with c3:
-    show_img(ART/"mlp_confusion_matrix.png", "MLP — Confusion Matrix")
-
-st.divider()
-st.caption("Tip: the app mirrors the training pipeline: clean → scale numerics (saved scaler) → model-specific encoding (OHE or categorical indices).")
+st.success("Done.")
