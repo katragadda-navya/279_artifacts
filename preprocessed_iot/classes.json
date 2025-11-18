@@ -1,0 +1,14 @@
+[
+  "ARP Spoofing",
+  "Benign",
+  "DNS Flood",
+  "Dictionary Attack",
+  "ICMP Flood",
+  "OS Scan",
+  "Ping Sweep",
+  "Port Scan",
+  "SYN Flood",
+  "Slowloris",
+  "UDP Flood",
+  "Vulnerability Scan"
+]
